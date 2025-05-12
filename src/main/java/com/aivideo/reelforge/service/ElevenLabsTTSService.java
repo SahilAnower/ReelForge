@@ -1,0 +1,92 @@
+package com.aivideo.reelforge.service;
+
+import com.aivideo.reelforge.exception.TTSException;
+import com.aivideo.reelforge.service.base.TTSService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+
+import java.time.Duration;
+import java.util.Map;
+
+@Service
+@Slf4j
+public class ElevenLabsTTSService implements TTSService {
+    private final WebClient elevenLabsClient;
+    private final ObjectMapper objectMapper;
+
+    @Value("${elevenlabs.voiceid}")
+    private String defaultVoiceId;
+
+    @Value("${elevenlabs.modelid}")
+    private String modelId;
+
+    public ElevenLabsTTSService(
+            @Qualifier("elevenLabsWebClient") WebClient elevenLabsClient,
+            ObjectMapper objectMapper
+    ) {
+        this.elevenLabsClient = elevenLabsClient;
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public Mono<byte[]> synthesizeSpeech(String text) {
+        return synthesizeSpeech(text, defaultVoiceId);
+    }
+
+    private Mono<byte[]> synthesizeSpeech(String text, String voiceId) {
+        return elevenLabsClient.post()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/text-to-speech/{voiceId}")
+                        .queryParam("optimize_streaming_latency", 3)
+                        .build(voiceId))
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(createRequest(text))
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, this::handleErrorResponse)
+                .bodyToMono(byte[].class)
+                .doOnSubscribe(sub -> log.info("Generating speech for text length: {}", text.length()))
+                .retryWhen(Retry.backoff(3, Duration.ofSeconds(2))
+                        .filter(this::isRetryableError))
+                .onErrorMap(ex -> new TTSException("ElevenLabs TTS failed", ex));
+    }
+
+    private Map<String, Object> createRequest(String text) {
+        return Map.of(
+                "text", text,
+                "model_id", modelId,
+                "voice_settings", Map.of(
+                        "stability", 0.5,
+                        "similarity_boost", 0.8,
+                        "style", 0.2,
+                        "use_speaker_boost", true
+                )
+        );
+    }
+
+    private boolean isRetryableError(Throwable ex) {
+        return ex instanceof WebClientResponseException responseEx &&
+                (responseEx.getStatusCode().is5xxServerError() ||
+                        responseEx.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    private Mono<? extends Throwable> handleErrorResponse(ClientResponse response) {
+        return response.bodyToMono(String.class)
+                .defaultIfEmpty("Unknown error")
+                .flatMap(body -> {
+                    String message = String.format("ElevenLabs API error: %s (%d)", body, response.statusCode().value());
+                    return Mono.error(new TTSException(message));
+                });
+    }
+}
