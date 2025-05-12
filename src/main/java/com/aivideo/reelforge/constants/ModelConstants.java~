@@ -1,0 +1,5 @@
+package com.aivideo.reelforge.constants;
+
+public class ModelConstants {
+    public static final String STORY_PROMPT_TEMPLATE = "";
+}
